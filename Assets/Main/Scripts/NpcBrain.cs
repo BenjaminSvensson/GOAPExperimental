@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 #if UNITY_EDITOR
@@ -42,6 +42,21 @@ public class NpcBrain : MonoBehaviour
     [SerializeField, Min(0.1f)] private float turnSpeed = 8f;
     [SerializeField, Min(0.1f)] private float interactionReachDistance = 1.75f;
     [SerializeField, Min(0f)] private float forgetMissingObjectAfterSeconds = 1.5f;
+    [SerializeField] private bool alignToGround = true;
+    [SerializeField] private LayerMask groundMask = ~0;
+    [SerializeField, Min(0.1f)] private float groundProbeDistance = 3f;
+    [SerializeField, Min(0f)] private float groundProbeStartHeight = 1.1f;
+    [SerializeField, Min(0f)] private float groundSnapOffset = 0.05f;
+    [SerializeField, Min(0.1f)] private float maxVerticalSnapSpeed = 6f;
+    [SerializeField, Min(0f)] private float groundedGraceTime = 0.2f;
+    [SerializeField, Range(0f, 89f)] private float maxClimbSlope = 55f;
+    [SerializeField, Range(0f, 89f)] private float maxGroundTiltSlope = 50f;
+    [SerializeField, Min(0.1f)] private float groundAlignSpeed = 10f;
+    [SerializeField] private bool enableUnstuck = true;
+    [SerializeField, Min(0.1f)] private float stuckCheckInterval = 0.5f;
+    [SerializeField, Min(0f)] private float stuckMinTravelDistance = 0.08f;
+    [SerializeField, Min(1)] private int stuckChecksBeforeRecovery = 3;
+    [SerializeField, Min(0.1f)] private float unstuckDuration = 0.7f;
 
     [Header("Needs")]
     [SerializeField] private NpcNeedSettings needSettings = new NpcNeedSettings();
@@ -66,6 +81,9 @@ public class NpcBrain : MonoBehaviour
 
     [Header("Planner")]
     [SerializeField, Min(0.05f)] private float replanningInterval = 0.2f;
+    [SerializeField, Min(0.1f)] private float destinationHorizontalTolerance = 1.5f;
+    [SerializeField, Min(1)] private int maxUnreachableAttempts = 3;
+    [SerializeField, Min(0f)] private float unreachableCooldownSeconds = 2f;
     [SerializeField] private bool verboseDebug;
 
     [Header("Debug Output")]
@@ -80,6 +98,7 @@ public class NpcBrain : MonoBehaviour
     [SerializeField] private bool drawKnownObjectGizmos = true;
     [SerializeField] private bool drawCurrentTaskGizmo = true;
     [SerializeField] private bool drawNeedsGizmo = true;
+    [SerializeField] private bool drawGroundingGizmos = true;
     [SerializeField] private bool drawLabelGizmos = true;
     [SerializeField, Min(0.05f)] private float memoryMarkerRadius = 0.2f;
 
@@ -91,6 +110,10 @@ public class NpcBrain : MonoBehaviour
     [SerializeField] private float activeTaskDistance;
     [SerializeField] private int visibleMemories;
     [SerializeField] private int totalMemories;
+    [SerializeField] private bool isGrounded;
+    [SerializeField] private float groundSlope;
+    [SerializeField] private int stuckCounter;
+    [SerializeField] private bool isRecoveringFromStuck;
     [SerializeField] private List<string> inventoryDebug = new List<string>();
     [SerializeField] private List<string> memoryDebug = new List<string>();
     [SerializeField] private List<string> recentDebugEvents = new List<string>();
@@ -98,6 +121,8 @@ public class NpcBrain : MonoBehaviour
     private readonly List<Memory> memories = new List<Memory>();
     private readonly List<NpcPickupItem> inventory = new List<NpcPickupItem>();
     private readonly Dictionary<NpcGoalDefinition, GoalState> goalStates = new Dictionary<NpcGoalDefinition, GoalState>();
+    private readonly Dictionary<NpcWorldObject, int> unreachableAttempts = new Dictionary<NpcWorldObject, int>();
+    private readonly Dictionary<NpcWorldObject, float> blockedTargetsUntil = new Dictionary<NpcWorldObject, float>();
 
     private PlanTask currentTask;
     private NpcInteractable pendingInteractable;
@@ -107,6 +132,12 @@ public class NpcBrain : MonoBehaviour
     private float nextPerceptionTime;
     private float nextPlanTime;
     private float nextStatusLogTime;
+    private float nextStuckCheckTime;
+    private float unstuckUntilTime;
+    private Vector3 unstuckDirection;
+    private Vector3 lastStuckCheckPosition;
+    private float lastGroundedTime;
+    private Vector3 currentGroundNormal = Vector3.up;
     private NpcWorldObject selfWorldObject;
 
     public NpcWorldObject WorldObject => selfWorldObject;
@@ -135,6 +166,7 @@ public class NpcBrain : MonoBehaviour
             m.visible = false;
         }
 
+        lastStuckCheckPosition = transform.position;
         DebugEvent($"Initialized with {goals.Count} goals and {memories.Count} seeded memories.");
         UpdateRuntimeDebugViews();
     }
@@ -146,6 +178,7 @@ public class NpcBrain : MonoBehaviour
         boredom = Mathf.Clamp(boredom + needSettings.boredomIncreasePerSecond * dt, 0f, 100f);
         tiredness = Mathf.Clamp(tiredness + needSettings.tirednessIncreasePerSecond * dt, 0f, 100f);
 
+        UpdateGroundState(true, dt);
         TickGoalDeadlines();
         if (Time.time >= nextPerceptionTime) { ScanVision(); nextPerceptionTime = Time.time + perceptionInterval; }
         if (!performingAction && Time.time >= nextPlanTime) { Replan(); nextPlanTime = Time.time + replanningInterval; }
@@ -311,8 +344,7 @@ public class NpcBrain : MonoBehaviour
         for (int i = 0; i < memories.Count; i++)
         {
             Memory memory = memories[i];
-            if (memory == null || memory.obj == null) continue;
-            NpcInteractable interactable = memory.obj.Interactable;
+            if (memory == null || memory.obj == null) continue;            NpcInteractable interactable = memory.obj.Interactable;
             if (interactable == null || !interactable.CanInteract(this)) continue;
             if (memory.visible && !interactable.IsAvailable) { Forget(memory.obj); continue; }
 
@@ -327,7 +359,7 @@ public class NpcBrain : MonoBehaviour
             if (score <= bestNeedScore) continue;
 
             bestNeedScore = score;
-            bestNeedTask = new PlanTask
+            bestNeedTask = new PlanTask 
             {
                 need = need,
                 action = PlanAction.Interact,
@@ -383,7 +415,7 @@ public class NpcBrain : MonoBehaviour
             case NpcGoalType.GoToObject: return BuildGoTask(goal, state);
             case NpcGoalType.InteractWithObject: return BuildInteractTask(goal);
             case NpcGoalType.Socialize: return BuildSocialGoalTask(goal);
-            default: return null;
+            default: return null; 
         }
     }
 
@@ -396,6 +428,7 @@ public class NpcBrain : MonoBehaviour
             Memory memory = FindMemory(goal.specificTarget);
             NpcPickupItem targetPickup = goal.specificTarget.PickupItem;
             if (memory == null || targetPickup == null) return null;
+            if (IsTargetTemporarilyBlocked(goal.specificTarget)) return null;
             if (targetPickup.IsPickedUp)
             {
                 Forget(goal.specificTarget);
@@ -420,8 +453,7 @@ public class NpcBrain : MonoBehaviour
         for (int i = 0; i < memories.Count; i++)
         {
             Memory memory = memories[i];
-            if (memory == null || memory.obj == null) continue;
-            NpcPickupItem pickup = memory.obj.PickupItem;
+            if (memory == null || memory.obj == null) continue;            NpcPickupItem pickup = memory.obj.PickupItem;
             if (pickup == null || !EqualsIgnoreCase(pickup.ItemType, goal.requiredItemType)) continue;
             if (pickup.IsPickedUp) { Forget(memory.obj); continue; }
 
@@ -449,6 +481,7 @@ public class NpcBrain : MonoBehaviour
         if (goal.specificTarget == null) return null;
         Memory memory = FindMemory(goal.specificTarget);
         if (memory == null) return null;
+        if (IsTargetTemporarilyBlocked(goal.specificTarget)) return null;
 
         float distance = Vector3.Distance(transform.position, memory.lastPos);
         if (distance <= stoppingDistance && memory.visible) { MarkGoalComplete(goal, state); return null; }
@@ -490,8 +523,7 @@ public class NpcBrain : MonoBehaviour
         for (int i = 0; i < memories.Count; i++)
         {
             Memory memory = memories[i];
-            if (memory == null || memory.obj == null) continue;
-            NpcInteractable interactable = memory.obj.Interactable;
+            if (memory == null || memory.obj == null) continue;            NpcInteractable interactable = memory.obj.Interactable;
             if (interactable == null || !interactable.CanInteract(this)) continue;
             if (memory.visible && !interactable.IsAvailable) { Forget(memory.obj); continue; }
 
@@ -576,15 +608,27 @@ public class NpcBrain : MonoBehaviour
         activeAction = currentTask.action.ToString();
         activeTarget = currentTask.target != null ? currentTask.target.name : "None";
         activeTaskScore = currentTask.score;
-        activeTaskDistance = Vector3.Distance(transform.position, destination);
+        activeTaskDistance = HorizontalDistanceTo(destination);
         StepMove(destination, dt);
-        if (Vector3.Distance(transform.position, destination) > GetActionReachDistance(currentTask.action)) return;
+        UpdateStuckRecovery(destination);
+        float reachDistance = Mathf.Max(GetActionReachDistance(currentTask.action), destinationHorizontalTolerance);
+
+        if (HorizontalDistanceTo(destination) > reachDistance) return;
 
         switch (currentTask.action)
         {
             case PlanAction.Move:
-                if (currentTask.target == null || IsVisible(currentTask.target)) CompleteTask(currentTask);
-                else { HandleLostTarget(currentTask.target); ClearTask(); }
+                if (currentTask.target == null || IsVisible(currentTask.target))
+                {
+                    CompleteTask(currentTask);
+                }
+                else
+                {
+                    RegisterUnreachableAttempt(currentTask.target, "move target not visible at arrival");
+                    HandleLostTarget(currentTask.target);
+                    ClearTask();
+                }
+
                 break;
             case PlanAction.Pickup:
                 TryDoPickup(currentTask);
@@ -608,6 +652,7 @@ public class NpcBrain : MonoBehaviour
         }
 
         if (task.target != null && FindMemory(task.target) == null) return false;
+        if (task.target != null && IsTargetTemporarilyBlocked(task.target)) return false;
         return task.action != PlanAction.Socialize || task.socialTarget != null;
     }
 
@@ -623,14 +668,49 @@ public class NpcBrain : MonoBehaviour
 
     private void StepMove(Vector3 destination, float dt)
     {
-        destination.y = transform.position.y;
-        Vector3 offset = destination - transform.position;
-        if (offset.sqrMagnitude < 0.0001f) return;
+        Vector3 from = transform.position;
+        Vector3 toTarget = destination - from;
+        toTarget.y = 0f;
+        if (toTarget.sqrMagnitude < 0.0001f)
+        {
+            AlignToGroundRotation(dt, transform.forward);
+            return;
+        }
 
-        Vector3 direction = offset.normalized;
-        Quaternion rotation = Quaternion.LookRotation(direction, Vector3.up);
-        transform.rotation = Quaternion.Slerp(transform.rotation, rotation, turnSpeed * dt);
-        transform.position = Vector3.MoveTowards(transform.position, destination, moveSpeed * dt);
+        Vector3 moveDirection = toTarget.normalized;
+        if (enableUnstuck && Time.time < unstuckUntilTime)
+        {
+            moveDirection = unstuckDirection;
+            isRecoveringFromStuck = true;
+        }
+        else
+        {
+            isRecoveringFromStuck = false;
+        }
+
+        if (alignToGround && isGrounded)
+        {
+            moveDirection = Vector3.ProjectOnPlane(moveDirection, currentGroundNormal).normalized;
+            if (moveDirection.sqrMagnitude < 0.001f)
+            {
+                moveDirection = Vector3.ProjectOnPlane(transform.forward, currentGroundNormal).normalized;
+            }
+        }
+
+        if (isGrounded && groundSlope > maxClimbSlope)
+        {
+            moveDirection = Vector3.ProjectOnPlane(moveDirection, Vector3.up).normalized;
+        }
+
+        if (moveDirection.sqrMagnitude < 0.0001f)
+        {
+            AlignToGroundRotation(dt, transform.forward);
+            return;
+        }
+
+        transform.position += moveDirection * (moveSpeed * dt);
+        UpdateGroundState(true, dt);
+        AlignToGroundRotation(dt, moveDirection);
     }
 
     private float GetActionReachDistance(PlanAction action)
@@ -642,12 +722,179 @@ public class NpcBrain : MonoBehaviour
 
         return stoppingDistance;
     }
+    private bool TryGetGroundHit(out RaycastHit hit)
+    {
+        Vector3 origin = transform.position + Vector3.up * groundProbeStartHeight;
+        float rayLength = groundProbeStartHeight + groundProbeDistance;
+
+        RaycastHit[] hits = Physics.RaycastAll(origin, Vector3.down, rayLength, groundMask, QueryTriggerInteraction.Ignore);
+        hit = default;
+        float bestDistance = float.MaxValue;
+
+        for (int i = 0; i < hits.Length; i++)
+        {
+            RaycastHit candidate = hits[i];
+            if (candidate.collider == null)
+            {
+                continue;
+            }
+
+            if (candidate.transform.IsChildOf(transform))
+            {
+                continue;
+            }
+
+            if (candidate.distance < bestDistance)
+            {
+                bestDistance = candidate.distance;
+                hit = candidate;
+            }
+        }
+
+        return bestDistance < float.MaxValue;
+    }
+
+    private void UpdateGroundState(bool snapToGround, float dt)
+    {
+        if (!TryGetGroundHit(out RaycastHit hit))
+        {
+            bool withinGrace = Time.time - lastGroundedTime <= groundedGraceTime;
+            isGrounded = withinGrace;
+            if (!withinGrace)
+            {
+                groundSlope = 0f;
+                currentGroundNormal = Vector3.up;
+            }
+
+            return;
+        }
+
+        isGrounded = true;
+        lastGroundedTime = Time.time;
+        currentGroundNormal = hit.normal.normalized;
+        groundSlope = Vector3.Angle(currentGroundNormal, Vector3.up);
+
+        if (!snapToGround)
+        {
+            return;
+        }
+
+        float targetY = hit.point.y + groundSnapOffset;
+        Vector3 pos = transform.position;
+        pos.y = Mathf.MoveTowards(pos.y, targetY, Mathf.Max(0.01f, maxVerticalSnapSpeed) * dt);
+        transform.position = pos;
+    }
+
+    private void AlignToGroundRotation(float dt, Vector3 forwardDirection)
+    {
+        bool allowTilt = alignToGround && isGrounded && groundSlope <= maxGroundTiltSlope;
+        Vector3 up = allowTilt ? currentGroundNormal : Vector3.up;
+        Vector3 forward = forwardDirection;
+
+        if (alignToGround && isGrounded)
+        {
+            forward = Vector3.ProjectOnPlane(forwardDirection, up);
+            if (forward.sqrMagnitude < 0.001f)
+            {
+                forward = Vector3.ProjectOnPlane(transform.forward, up);
+            }
+        }
+
+        if (forward.sqrMagnitude < 0.001f)
+        {
+            return;
+        }
+
+        Quaternion desired = Quaternion.LookRotation(forward.normalized, up);
+        float speed = Mathf.Max(turnSpeed, groundAlignSpeed);
+        transform.rotation = Quaternion.Slerp(transform.rotation, desired, speed * dt);
+    }
+
+    private void UpdateStuckRecovery(Vector3 destination)
+    {
+        if (!enableUnstuck || performingAction || currentTask == null)
+        {
+            return;
+        }
+
+        if (Time.time < unstuckUntilTime)
+        {
+            isRecoveringFromStuck = true;
+            return;
+        }
+
+        isRecoveringFromStuck = false;
+
+        if (Time.time < nextStuckCheckTime)
+        {
+            return;
+        }
+
+        nextStuckCheckTime = Time.time + stuckCheckInterval;
+
+        float remaining = HorizontalDistanceTo(destination);
+        float reach = Mathf.Max(GetActionReachDistance(currentTask.action), destinationHorizontalTolerance);
+        if (remaining <= reach + 0.2f)
+        {
+            stuckCounter = 0;
+            lastStuckCheckPosition = transform.position;
+            return;
+        }
+
+        float moved = Vector3.Distance(transform.position, lastStuckCheckPosition);
+        lastStuckCheckPosition = transform.position;
+
+        if (moved >= stuckMinTravelDistance)
+        {
+            stuckCounter = 0;
+            return;
+        }
+
+        stuckCounter++;
+        DebugEvent($"Low movement detected ({moved:F2}m). Stuck {stuckCounter}/{stuckChecksBeforeRecovery}.", true);
+        if (stuckCounter < stuckChecksBeforeRecovery)
+        {
+            return;
+        }
+
+        RegisterUnreachableAttempt(currentTask.target, "movement stuck");
+
+        Vector3 toTarget = destination - transform.position;
+        toTarget.y = 0f;
+        if (toTarget.sqrMagnitude < 0.001f)
+        {
+            toTarget = transform.forward;
+        }
+
+        Vector3 side = Vector3.Cross(Vector3.up, toTarget.normalized);
+        if (side.sqrMagnitude < 0.001f)
+        {
+            side = transform.right;
+        }
+
+        float sign = UnityEngine.Random.value < 0.5f ? -1f : 1f;
+        Vector3 recovery = (toTarget.normalized + side.normalized * sign).normalized;
+        if (alignToGround && isGrounded)
+        {
+            recovery = Vector3.ProjectOnPlane(recovery, currentGroundNormal).normalized;
+            if (recovery.sqrMagnitude < 0.001f)
+            {
+                recovery = side.normalized * sign;
+            }
+        }
+
+        unstuckDirection = recovery;
+        unstuckUntilTime = Time.time + unstuckDuration;
+        stuckCounter = 0;
+        isRecoveringFromStuck = true;
+        DebugEvent($"Unstuck recovery triggered for {unstuckDuration:F1}s.");
+    }
 
     private void TryDoPickup(PlanTask task)
     {
         if (task.target == null) { DebugEvent("Pickup failed: no target."); ClearTask(); return; }
         Memory memory = FindMemory(task.target);
-        if (memory == null) { DebugEvent($"Pickup failed for '{task.target.name}': no memory."); ClearTask(); return; }
+        if (memory == null) { DebugEvent($"Pickup failed for '{task.target.name}': no memory."); RegisterUnreachableAttempt(task.target, "no memory for pickup"); ClearTask(); return; }
 
         float reach = GetActionReachDistance(PlanAction.Pickup);
         float distanceToKnownPosition = Vector3.Distance(transform.position, memory.lastPos);
@@ -655,6 +902,7 @@ public class NpcBrain : MonoBehaviour
         if (!memory.visible && !canPickupFromKnownPosition)
         {
             DebugEvent($"Pickup failed for '{task.target.name}': target not visible and out of reach ({distanceToKnownPosition:F2}m).");
+            RegisterUnreachableAttempt(task.target, "pickup out of reach");
             HandleLostTarget(task.target);
             ClearTask();
             return;
@@ -669,6 +917,7 @@ public class NpcBrain : MonoBehaviour
         if (pickup == null)
         {
             DebugEvent($"Pickup failed for '{task.target.name}': no pickup component.");
+            RegisterUnreachableAttempt(task.target, "missing pickup component");
             HandleLostTarget(task.target);
             ClearTask();
             return;
@@ -684,6 +933,7 @@ public class NpcBrain : MonoBehaviour
             else
             {
                 DebugEvent($"Pickup failed at '{task.target.name}'.");
+                RegisterUnreachableAttempt(task.target, "pickup interaction failed");
             }
 
             ClearTask();
@@ -703,6 +953,7 @@ public class NpcBrain : MonoBehaviour
         if (memory == null)
         {
             DebugEvent($"Interact failed for '{task.target.name}': no memory.");
+            RegisterUnreachableAttempt(task.target, "no memory for interact");
             ClearTask();
             return;
         }
@@ -710,6 +961,7 @@ public class NpcBrain : MonoBehaviour
         if (interactable == null)
         {
             DebugEvent($"Interact failed for '{task.target.name}': no interactable component.");
+            RegisterUnreachableAttempt(task.target, "missing interactable component");
             HandleLostTarget(task.target);
             ClearTask();
             return;
@@ -729,6 +981,7 @@ public class NpcBrain : MonoBehaviour
         if (!memory.visible && !canInteractFromKnownPosition)
         {
             DebugEvent($"Interact failed for '{task.target.name}': target not visible and out of reach ({distanceToKnownPosition:F2}m).");
+            RegisterUnreachableAttempt(task.target, "interact out of reach");
             HandleLostTarget(task.target);
             ClearTask();
             return;
@@ -751,7 +1004,7 @@ public class NpcBrain : MonoBehaviour
     {
         if (task.socialTarget == null || task.target == null) { DebugEvent("Social failed: no target NPC."); ClearTask(); return; }
         Memory memory = FindMemory(task.target);
-        if (memory == null || !memory.visible) { DebugEvent($"Social failed: '{task.target.name}' not visible."); HandleLostTarget(task.target); ClearTask(); return; }
+        if (memory == null || !memory.visible) { DebugEvent($"Social failed: '{task.target.name}' not visible."); RegisterUnreachableAttempt(task.target, "social target not visible"); HandleLostTarget(task.target); ClearTask(); return; }
 
         pendingInteractable = null;
         pendingSocialTarget = task.socialTarget;
@@ -842,6 +1095,59 @@ public class NpcBrain : MonoBehaviour
     }
 
     private float DistanceScore(float distance) => 1f / (1f + distance * 0.2f * personality.travelCostBias);
+
+    private float HorizontalDistanceTo(Vector3 worldPosition)
+    {
+        Vector3 a = transform.position;
+        a.y = 0f;
+        Vector3 b = worldPosition;
+        b.y = 0f;
+        return Vector3.Distance(a, b);
+    }
+
+    private bool IsTargetTemporarilyBlocked(NpcWorldObject target)
+    {
+        if (target == null)
+        {
+            return false;
+        }
+
+        if (!blockedTargetsUntil.TryGetValue(target, out float untilTime))
+        {
+            return false;
+        }
+
+        if (Time.time >= untilTime)
+        {
+            blockedTargetsUntil.Remove(target);
+            return false;
+        }
+
+        return true;
+    }
+
+    private void RegisterUnreachableAttempt(NpcWorldObject target, string reason)
+    {
+        if (target == null)
+        {
+            return;
+        }
+
+        int attempts = 0;
+        unreachableAttempts.TryGetValue(target, out attempts);
+        attempts++;
+        unreachableAttempts[target] = attempts;
+
+        DebugEvent($"Unreachable attempt {attempts}/{maxUnreachableAttempts} for '{target.name}' ({reason}).", true);
+        if (attempts < maxUnreachableAttempts)
+        {
+            return;
+        }
+
+        unreachableAttempts[target] = 0;
+        blockedTargetsUntil[target] = Time.time + Mathf.Max(0f, unreachableCooldownSeconds);
+        DebugEvent($"Temporarily abandoning '{target.name}' for {unreachableCooldownSeconds:F1}s.");
+    }
 
     private Memory FindMemory(NpcWorldObject worldObject)
     {
@@ -998,8 +1304,7 @@ public class NpcBrain : MonoBehaviour
         for (int i = 0; i < memories.Count; i++)
         {
             Memory memory = memories[i];
-            if (memory == null || memory.obj == null) continue;
-            if (memory.visible) visibleMemories++;
+            if (memory == null || memory.obj == null) continue;            if (memory.visible) visibleMemories++;
             float seenAgo = memory.lastSeen < 0f ? -1f : Time.time - memory.lastSeen;
             string seenText = memory.visible ? "Visible" : $"Memory ({seenAgo:F1}s ago)";
             memoryDebug.Add($"{memory.obj.name} [{seenText}] at {FormatVec(memory.lastPos)}");
@@ -1125,7 +1430,6 @@ public class NpcBrain : MonoBehaviour
             {
                 Memory memory = memories[i];
                 if (memory == null || memory.obj == null) continue;
-
                 Gizmos.color = memory.visible ? new Color(0.1f, 1f, 0.2f, 0.9f) : new Color(1f, 0.7f, 0.1f, 0.9f);
                 Gizmos.DrawWireSphere(memory.lastPos + Vector3.up * 0.05f, memoryMarkerRadius);
                 Gizmos.DrawLine(transform.position + Vector3.up * 0.1f, memory.lastPos + Vector3.up * 0.05f);
@@ -1140,6 +1444,19 @@ public class NpcBrain : MonoBehaviour
             Gizmos.DrawSphere(destination + Vector3.up * 0.1f, memoryMarkerRadius * 0.75f);
         }
 
+        if (drawGroundingGizmos)
+        {
+            Vector3 origin = transform.position + Vector3.up * 0.15f;
+            Gizmos.color = isGrounded ? new Color(0.15f, 1f, 0.45f, 0.9f) : new Color(1f, 0.25f, 0.25f, 0.9f);
+            Gizmos.DrawLine(origin, origin + currentGroundNormal * 1.1f);
+
+            if (isRecoveringFromStuck)
+            {
+                Gizmos.color = new Color(1f, 0.25f, 0.9f, 0.95f);
+                Gizmos.DrawLine(origin, origin + unstuckDirection.normalized * 1.3f);
+            }
+        }
+
         if (drawNeedsGizmo)
         {
             DrawNeedBar(labelBase + Vector3.up * 0.20f, hunger / 100f, new Color(1f, 0.25f, 0.25f, 1f));
@@ -1151,7 +1468,7 @@ public class NpcBrain : MonoBehaviour
         if (drawLabelGizmos)
         {
             Handles.color = Color.white;
-            Handles.Label(labelBase + Vector3.up * 0.30f, $"{name}\n{activeAction}\n{activePlan}\nH:{hunger:F0} B:{boredom:F0} T:{tiredness:F0}");
+            Handles.Label(labelBase + Vector3.up * 0.30f, $"{name}\n{activeAction}\n{activePlan}\nH:{hunger:F0} B:{boredom:F0} T:{tiredness:F0}\nGrounded:{isGrounded} Slope:{groundSlope:F1} Stuck:{stuckCounter}");
 
             if (drawKnownObjectGizmos)
             {
@@ -1159,7 +1476,6 @@ public class NpcBrain : MonoBehaviour
                 {
                     Memory memory = memories[i];
                     if (memory == null || memory.obj == null) continue;
-
                     float seenAgo = memory.lastSeen < 0f ? -1f : Time.time - memory.lastSeen;
                     string seenText = memory.visible ? "visible" : $"{seenAgo:F1}s ago";
                     Handles.Label(memory.lastPos + Vector3.up * 0.35f, $"{memory.obj.name}\n{seenText}");
@@ -1169,3 +1485,22 @@ public class NpcBrain : MonoBehaviour
 #endif
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
