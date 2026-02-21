@@ -32,7 +32,10 @@ public class NpcPickupItem : MonoBehaviour
 
         if (parentToPickerWhenPickedUp)
         {
-            transform.SetParent(picker.transform, true);
+            Transform holdPoint = picker.ItemHoldPoint;
+            transform.SetParent(holdPoint, false);
+            transform.localPosition = Vector3.zero;
+            transform.localRotation = Quaternion.identity;
         }
 
         if (disableObjectWhenPickedUp)

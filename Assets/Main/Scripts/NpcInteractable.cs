@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -26,6 +26,8 @@ public class NpcInteractable : MonoBehaviour
 
     public float InteractionDuration => interactionDuration;
     public bool IsAvailable => !oneShot || !hasBeenUsed;
+    public bool RequiresItem => requiresItem;
+    public string RequiredItemType => requiredItemType;
 
     public float GetNeedRelief(NpcNeedType needType)
     {

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 #if UNITY_EDITOR
@@ -34,13 +34,21 @@ public class NpcBrain : MonoBehaviour
     [SerializeField] private bool useLineOfSight = true;
     [SerializeField] private LayerMask lineOfSightBlockers = ~0;
     [SerializeField, Min(0.05f)] private float perceptionInterval = 0.25f;
+    [SerializeField] private bool useHorizontalVisionAngle = true;
+    [SerializeField, Min(0f)] private float closeSightDistance = 1.75f;
+    [SerializeField, Min(0f)] private float lowObjectSightHeightBias = 0.12f;
+    [SerializeField, Min(0f)] private float visionRayRadius = 0.05f;
     [SerializeField] private List<NpcWorldObject> initialKnownObjects = new List<NpcWorldObject>();
+
+    [Header("Inventory")]
+    [SerializeField] private Transform itemHoldPoint;
 
     [Header("Movement")]
     [SerializeField, Min(0.1f)] private float moveSpeed = 2.4f;
     [SerializeField, Min(0.1f)] private float stoppingDistance = 1.25f;
     [SerializeField, Min(0.1f)] private float turnSpeed = 8f;
     [SerializeField, Min(0.1f)] private float interactionReachDistance = 1.75f;
+    [SerializeField, Min(0.1f)] private float pickupReachDistance = 3.5f;
     [SerializeField, Min(0f)] private float forgetMissingObjectAfterSeconds = 1.5f;
     [SerializeField] private bool alignToGround = true;
     [SerializeField] private LayerMask groundMask = ~0;
@@ -57,6 +65,13 @@ public class NpcBrain : MonoBehaviour
     [SerializeField, Min(0f)] private float stuckMinTravelDistance = 0.08f;
     [SerializeField, Min(1)] private int stuckChecksBeforeRecovery = 3;
     [SerializeField, Min(0.1f)] private float unstuckDuration = 0.7f;
+    [SerializeField] private bool enableWallAvoidance = true;
+    [SerializeField] private LayerMask wallAvoidanceMask = ~0;
+    [SerializeField, Min(0.05f)] private float wallProbeRadius = 0.25f;
+    [SerializeField, Min(0.1f)] private float wallProbeDistance = 0.85f;
+    [SerializeField, Min(0f)] private float wallProbeHeight = 0.45f;
+    [SerializeField, Range(0f, 1f)] private float wallAvoidBlend = 0.7f;
+    [SerializeField, Min(0f)] private float wallAvoidMemorySeconds = 0.2f;
 
     [Header("Needs")]
     [SerializeField] private NpcNeedSettings needSettings = new NpcNeedSettings();
@@ -138,9 +153,12 @@ public class NpcBrain : MonoBehaviour
     private Vector3 lastStuckCheckPosition;
     private float lastGroundedTime;
     private Vector3 currentGroundNormal = Vector3.up;
+    private Vector3 wallAvoidDirection = Vector3.zero;
+    private float wallAvoidUntilTime;
     private NpcWorldObject selfWorldObject;
 
     public NpcWorldObject WorldObject => selfWorldObject;
+    public Transform ItemHoldPoint => itemHoldPoint != null ? itemHoldPoint : transform;
 
     private void Awake()
     {
@@ -252,16 +270,49 @@ public class NpcBrain : MonoBehaviour
     private bool CanSee(NpcWorldObject obj)
     {
         Vector3 eye = eyePoint != null ? eyePoint.position : transform.position;
-        Vector3 toTarget = obj.transform.position - eye;
+        Vector3 targetPoint = GetVisionTargetPoint(obj);
+        Vector3 toTarget = targetPoint - eye;
         if (toTarget.sqrMagnitude > visionRange * visionRange) return false;
-        if (visionAngle < 360f && Vector3.Angle(transform.forward, toTarget) > visionAngle * 0.5f) return false;
+
+        float distance = toTarget.magnitude;
+        if (distance > closeSightDistance && visionAngle < 360f)
+        {
+            Vector3 forwardCheck = transform.forward;
+            Vector3 directionCheck = toTarget;
+            if (useHorizontalVisionAngle)
+            {
+                forwardCheck.y = 0f;
+                directionCheck.y = 0f;
+                if (forwardCheck.sqrMagnitude < 0.001f || directionCheck.sqrMagnitude < 0.001f)
+                {
+                    forwardCheck = transform.forward;
+                    directionCheck = toTarget;
+                }
+            }
+
+            if (Vector3.Angle(forwardCheck, directionCheck) > visionAngle * 0.5f) return false;
+        }
         if (!useLineOfSight) return true;
 
-        Vector3 direction = toTarget.normalized;
-        float distance = toTarget.magnitude;
+        Vector3 direction = toTarget / Mathf.Max(distance, 0.0001f);
         Vector3 origin = eye + direction * 0.05f;
-        if (!Physics.Raycast(origin, direction, out RaycastHit hit, distance, lineOfSightBlockers, QueryTriggerInteraction.Ignore)) return true;
-        return hit.transform.IsChildOf(obj.transform);
+        float castDistance = Mathf.Max(0f, distance - 0.05f);
+        bool blocked = Physics.SphereCast(origin, visionRayRadius, direction, out RaycastHit hit, castDistance, lineOfSightBlockers, QueryTriggerInteraction.Ignore);
+        if (!blocked) return true;
+        return hit.transform != null && hit.transform.IsChildOf(obj.transform);
+    }
+    private Vector3 GetVisionTargetPoint(NpcWorldObject obj)
+    {
+        Collider col = obj.GetComponentInChildren<Collider>();
+        if (col == null)
+        {
+            return obj.transform.position + Vector3.up * lowObjectSightHeightBias;
+        }
+
+        Bounds bounds = col.bounds;
+        float halfHeight = Mathf.Max(0.05f, bounds.extents.y);
+        float lowY = bounds.min.y + Mathf.Clamp(lowObjectSightHeightBias, 0.02f, halfHeight);
+        return new Vector3(bounds.center.x, lowY, bounds.center.z);
     }
 
     private void Replan()
@@ -344,30 +395,45 @@ public class NpcBrain : MonoBehaviour
         for (int i = 0; i < memories.Count; i++)
         {
             Memory memory = memories[i];
-            if (memory == null || memory.obj == null) continue;            NpcInteractable interactable = memory.obj.Interactable;
-            if (interactable == null || !interactable.CanInteract(this)) continue;
+            if (memory == null || memory.obj == null) continue;
+
+            NpcInteractable interactable = memory.obj.Interactable;
+            if (interactable == null) continue;
             if (memory.visible && !interactable.IsAvailable) { Forget(memory.obj); continue; }
 
             float relief = interactable.GetNeedRelief(need);
             if (relief <= 0f) continue;
 
-            float score = urgency * needWeight;
-            score += Mathf.Clamp01(relief / 100f) * 0.8f;
-            score += DistanceScore(Vector3.Distance(transform.position, memory.lastPos)) * 0.5f;
-            score += memory.obj.Desirability * 0.15f;
-            if (memory.visible) score += 0.2f;
-            if (score <= bestNeedScore) continue;
+            float baseScore = urgency * needWeight;
+            baseScore += Mathf.Clamp01(relief / 100f) * 0.8f;
+            baseScore += DistanceScore(Vector3.Distance(transform.position, memory.lastPos)) * 0.5f;
+            baseScore += memory.obj.Desirability * 0.15f;
+            if (memory.visible) baseScore += 0.2f;
 
-            bestNeedScore = score;
-            bestNeedTask = new PlanTask 
+            PlanTask candidate = null;
+            if (interactable.CanInteract(this))
             {
-                need = need,
-                action = PlanAction.Interact,
-                target = memory.obj,
-                destination = memory.lastPos,
-                score = score,
-                label = $"Need/{need} -> Interact {memory.obj.name}"
-            };
+                candidate = new PlanTask
+                {
+                    need = need,
+                    action = PlanAction.Interact,
+                    target = memory.obj,
+                    destination = memory.lastPos,
+                    score = baseScore,
+                    label = $"Need/{need} -> Interact {memory.obj.name}"
+                };
+            }
+            else if (interactable.RequiresItem && !string.IsNullOrWhiteSpace(interactable.RequiredItemType))
+            {
+                candidate = BuildPickupTaskForItemType(
+                    interactable.RequiredItemType,
+                    baseScore * 0.9f,
+                    $"Need/{need} -> Acquire {interactable.RequiredItemType} for {memory.obj.name}");
+            }
+
+            if (candidate == null || candidate.score <= bestNeedScore) continue;
+            bestNeedScore = candidate.score;
+            bestNeedTask = candidate;
         }
 
         if (need != NpcNeedType.Boredom || personality.sociability <= 0f) return bestNeedTask;
@@ -375,7 +441,6 @@ public class NpcBrain : MonoBehaviour
         if (socialTask == null) return bestNeedTask;
         return bestNeedTask == null || socialTask.score > bestNeedTask.score ? socialTask : bestNeedTask;
     }
-
     private PlanTask EvaluateSocialTask(float urgency, float needWeight)
     {
         PlanTask best = null;
@@ -502,11 +567,24 @@ public class NpcBrain : MonoBehaviour
         {
             Memory memory = FindMemory(goal.specificTarget);
             NpcInteractable interactable = goal.specificTarget.Interactable;
-            if (memory == null || interactable == null || !interactable.CanInteract(this)) return null;
+            if (memory == null || interactable == null) return null;
             if (memory.visible && !interactable.IsAvailable) { Forget(goal.specificTarget); return null; }
 
             float score = DistanceScore(Vector3.Distance(transform.position, memory.lastPos));
             score += Mathf.Clamp01(interactable.GetNeedRelief(goal.preferredNeed) / 100f);
+
+            if (!interactable.CanInteract(this))
+            {
+                if (interactable.RequiresItem && !string.IsNullOrWhiteSpace(interactable.RequiredItemType))
+                {
+                    return BuildPickupTaskForItemType(
+                        interactable.RequiredItemType,
+                        score,
+                        $"Goal/{goal.goalName} -> Acquire {interactable.RequiredItemType} for {goal.specificTarget.name}");
+                }
+
+                return null;
+            }
 
             return new PlanTask
             {
@@ -523,24 +601,76 @@ public class NpcBrain : MonoBehaviour
         for (int i = 0; i < memories.Count; i++)
         {
             Memory memory = memories[i];
-            if (memory == null || memory.obj == null) continue;            NpcInteractable interactable = memory.obj.Interactable;
-            if (interactable == null || !interactable.CanInteract(this)) continue;
+            if (memory == null || memory.obj == null) continue;
+
+            NpcInteractable interactable = memory.obj.Interactable;
+            if (interactable == null) continue;
             if (memory.visible && !interactable.IsAvailable) { Forget(memory.obj); continue; }
 
             float relief = interactable.GetNeedRelief(goal.preferredNeed);
             if (relief <= 0f) continue;
 
             float score = Mathf.Clamp01(relief / 100f) + DistanceScore(Vector3.Distance(transform.position, memory.lastPos)) + memory.obj.Desirability * 0.1f;
+            PlanTask candidate = null;
+
+            if (interactable.CanInteract(this))
+            {
+                candidate = new PlanTask
+                {
+                    action = PlanAction.Interact,
+                    target = memory.obj,
+                    destination = memory.lastPos,
+                    score = score,
+                    label = $"Goal/{goal.goalName} -> Interact best for {goal.preferredNeed}"
+                };
+            }
+            else if (interactable.RequiresItem && !string.IsNullOrWhiteSpace(interactable.RequiredItemType))
+            {
+                candidate = BuildPickupTaskForItemType(
+                    interactable.RequiredItemType,
+                    score * 0.9f,
+                    $"Goal/{goal.goalName} -> Acquire {interactable.RequiredItemType} for {memory.obj.name}");
+            }
+
+            if (candidate == null || candidate.score <= bestScore) continue;
+            bestScore = candidate.score;
+            best = candidate;
+        }
+
+        return best;
+    }
+    private PlanTask BuildPickupTaskForItemType(string itemType, float baseScore, string label)
+    {
+        if (string.IsNullOrWhiteSpace(itemType) || HasItem(itemType)) return null;
+
+        PlanTask best = null;
+        float bestScore = float.MinValue;
+
+        for (int i = 0; i < memories.Count; i++)
+        {
+            Memory memory = memories[i];
+            if (memory == null || memory.obj == null) continue;
+            if (IsTargetTemporarilyBlocked(memory.obj)) continue;
+
+            NpcPickupItem pickup = memory.obj.PickupItem;
+            if (pickup == null || !EqualsIgnoreCase(pickup.ItemType, itemType)) continue;
+            if (pickup.IsPickedUp) { Forget(memory.obj); continue; }
+
+            float score = baseScore;
+            score += pickup.Usefulness * personality.itemUsefulnessBias;
+            score += memory.obj.Desirability * 0.25f;
+            score += DistanceScore(Vector3.Distance(transform.position, memory.lastPos)) * (1f / Mathf.Max(0.01f, personality.travelCostBias));
+            if (memory.visible) score += 0.2f;
             if (score <= bestScore) continue;
 
             bestScore = score;
             best = new PlanTask
             {
-                action = PlanAction.Interact,
+                action = PlanAction.Pickup,
                 target = memory.obj,
                 destination = memory.lastPos,
                 score = score,
-                label = $"Goal/{goal.goalName} -> Interact best for {goal.preferredNeed}"
+                label = label
             };
         }
 
@@ -688,6 +818,8 @@ public class NpcBrain : MonoBehaviour
             isRecoveringFromStuck = false;
         }
 
+        moveDirection = ApplyWallAvoidance(moveDirection);
+
         if (alignToGround && isGrounded)
         {
             moveDirection = Vector3.ProjectOnPlane(moveDirection, currentGroundNormal).normalized;
@@ -712,10 +844,57 @@ public class NpcBrain : MonoBehaviour
         UpdateGroundState(true, dt);
         AlignToGroundRotation(dt, moveDirection);
     }
+    private Vector3 ApplyWallAvoidance(Vector3 desiredDirection)
+    {
+        if (!enableWallAvoidance || desiredDirection.sqrMagnitude < 0.001f)
+        {
+            return desiredDirection;
+        }
+
+        if (Time.time < wallAvoidUntilTime && wallAvoidDirection.sqrMagnitude > 0.001f)
+        {
+            desiredDirection = Vector3.Slerp(desiredDirection, wallAvoidDirection, wallAvoidBlend).normalized;
+        }
+
+        Vector3 origin = transform.position + Vector3.up * wallProbeHeight;
+        float probeDistance = Mathf.Max(wallProbeDistance, moveSpeed * 0.2f);
+        if (!Physics.SphereCast(origin, wallProbeRadius, desiredDirection, out RaycastHit hit, probeDistance, wallAvoidanceMask, QueryTriggerInteraction.Ignore))
+        {
+            return desiredDirection;
+        }
+
+        if (hit.transform != null && hit.transform.IsChildOf(transform))
+        {
+            return desiredDirection;
+        }
+
+        Vector3 slide = Vector3.ProjectOnPlane(desiredDirection, hit.normal);
+        slide.y = 0f;
+        if (slide.sqrMagnitude < 0.0001f)
+        {
+            slide = Vector3.Cross(Vector3.up, hit.normal);
+            slide.y = 0f;
+        }
+
+        if (slide.sqrMagnitude < 0.0001f)
+        {
+            return desiredDirection;
+        }
+
+        wallAvoidDirection = slide.normalized;
+        wallAvoidUntilTime = Time.time + Mathf.Max(0f, wallAvoidMemorySeconds);
+        DebugEvent($"Avoiding wall '{hit.collider.name}'.", true);
+        return Vector3.Slerp(desiredDirection, wallAvoidDirection, wallAvoidBlend).normalized;
+    }
 
     private float GetActionReachDistance(PlanAction action)
     {
-        if (action == PlanAction.Interact || action == PlanAction.Pickup || action == PlanAction.Socialize)
+        if (action == PlanAction.Pickup)
+        {
+            return Mathf.Max(stoppingDistance, pickupReachDistance);
+        }
+
+        if (action == PlanAction.Interact || action == PlanAction.Socialize)
         {
             return Mathf.Max(stoppingDistance, interactionReachDistance);
         }
